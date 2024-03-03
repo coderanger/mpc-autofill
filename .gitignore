@@ -173,3 +173,4 @@ MPCAutofill/drives.csv
 /static/
 *.woff
 *.woff2
+/image-cdn/images/

@@ -1,0 +1,15 @@
+upstream gunicorn {
+    server image_cdn_gunicorn:5000;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    location / {
+        root /data/images;
+        try_files $uri $uri $uri/ @proxy;
+    }
+    location @proxy {
+        proxy_pass http://gunicorn;
+    }
+}

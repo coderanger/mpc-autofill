@@ -1,0 +1,47 @@
+version: "3.4"
+
+services:
+  # Redis is used for queueing tasks
+  redis:
+    image: redis:7.2.4
+    container_name: mpcautofill_redis
+    expose:
+      - 6379
+
+  # nginx serves cached images and passes work for new images along to gunicorn
+  image_cdn_nginx:
+    image: nginx:1.25.4
+    container_name: mpcautofill_image_cdn_nginx
+    ports:
+      - "8080:80"
+    environment:
+      - NGINX_PORT=80
+    volumes:
+      - ./image-cdn/templates:/etc/nginx/templates
+      - image_cdn_images:/data/images # read images cached by the RQ worker
+
+  # gunicorn runs Flask, which handles our business logic and enqueues tasks with RQ
+  image_cdn_gunicorn:
+    image: mpcautofill_image_cdn_gunicorn
+    container_name: mpcautofill_image_cdn_gunicorn
+    build:
+      context: ..
+      dockerfile: ./docker/image-cdn/Dockerfile
+    expose:
+      - 5000
+    ports:
+      - "5000:5000" # TODO: things seem to break when i remove this. not correct?
+    command: "gunicorn 'server:app' --bind 0.0.0.0:5000"
+
+  # RQ picks up work enqueued by Flask and caches images
+  image_cdn_worker:
+    image: mpcautofill_image_cdn_worker
+    build:
+      context: ..
+      dockerfile: ./docker/image-cdn/Dockerfile
+    command: "python3 worker.py"
+    volumes:
+      - image_cdn_images:/image-cdn/images # reads and writes to the cache
+
+volumes:
+  image_cdn_images:

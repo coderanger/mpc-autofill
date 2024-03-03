@@ -1,0 +1,4 @@
+flask~=3.0
+requests~=2.31.0
+rq~=1.16
+rq-scheduler~=0.13.1

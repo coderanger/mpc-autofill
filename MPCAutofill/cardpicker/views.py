@@ -1,10 +1,13 @@
+import copy
 import itertools
 import json
 from collections import defaultdict
 from random import sample
 from typing import Any, Callable, TypeVar, Union, cast
+from urllib.parse import urljoin
 
 import pycountry
+import requests
 import sentry_sdk
 from elasticsearch_dsl.index import Index
 from jsonschema import ValidationError, validate
@@ -27,6 +30,9 @@ from cardpicker.search.search_functions import (
     ping_elasticsearch,
 )
 from cardpicker.tags import Tags
+from cardpicker.utils import merge_tags
+
+UPSTREAM_ID_OFFSET = 10000
 
 # https://mypy.readthedocs.io/en/stable/generics.html#declaring-decorators
 F = TypeVar("F", bound=Callable[..., Any])
@@ -92,6 +98,20 @@ def post_search_results(request: HttpRequest) -> HttpResponse:
         if results[query.query].get(query.card_type, None) is None:
             hits = query.retrieve_card_identifiers(search_settings=search_settings)
             results[query.query][query.card_type] = hits
+    if settings.UPSTREAM_URL is not None:
+        upstream_json_body = copy.deepcopy(json_body)
+        sources = upstream_json_body["searchSettings"]["sourceSettings"]["sources"]
+        upstream_sources = [(id - UPSTREAM_ID_OFFSET, enabled) for id, enabled in sources if id >= UPSTREAM_ID_OFFSET]
+        upstream_json_body["searchSettings"]["sourceSettings"]["sources"] = upstream_sources
+        resp = requests.post(urljoin(settings.UPSTREAM_URL, "2/searchResults/"), json=upstream_json_body)
+        resp.raise_for_status()
+        for query, query_data in resp.json()["results"].items():
+            for card_type, upstream_hits in query_data.items():
+                hits = results.setdefault(query, {}).setdefault(card_type, [])
+                existing = set(hits)
+                for upstream_hit in upstream_hits:
+                    if upstream_hit not in existing:
+                        hits.append(upstream_hit)
     return JsonResponse({"results": results})
 
 
@@ -118,6 +138,13 @@ def post_cards(request: HttpRequest) -> HttpResponse:
         raise BadRequestException(f"Malformed JSON body:\n\n{e.message}")
 
     results = {x.identifier: x.to_dict() for x in Card.objects.filter(identifier__in=json_body["card_identifiers"])}
+    if settings.UPSTREAM_URL is not None:
+        upstream_card_identifiers = list(set(json_body["card_identifiers"]) - results.keys())
+        resp = requests.post(
+            urljoin(settings.UPSTREAM_URL, "2/cards/"), json={"card_identifiers": upstream_card_identifiers}
+        )
+        resp.raise_for_status()
+        results.update(resp.json()["results"])
     return JsonResponse({"results": results})
 
 
@@ -132,6 +159,12 @@ def get_sources(request: HttpRequest) -> HttpResponse:
         raise BadRequestException("Expected GET request.")
 
     results = {x.pk: x.to_dict() for x in Source.objects.order_by("ordinal", "pk")}
+    if settings.UPSTREAM_URL is not None:
+        resp = requests.get(urljoin(settings.UPSTREAM_URL, "2/sources/"))
+        resp.raise_for_status()
+        for data in resp.json()["results"].values():
+            data["pk"] = data["pk"] + UPSTREAM_ID_OFFSET
+            results[data["pk"]] = data
     return JsonResponse({"results": results})
 
 
@@ -158,14 +191,22 @@ def get_languages(request: HttpRequest) -> HttpResponse:
 
     if request.method != "GET":
         raise BadRequestException("Expected GET request.")
+    languages = [
+        {"name": language.name, "code": row[0].upper()}
+        for row in Card.objects.order_by().values_list("language").distinct()
+        if (language := pycountry.languages.get(alpha_2=row[0])) is not None
+    ]
+    if settings.UPSTREAM_URL is not None:
+        resp = requests.get(urljoin(settings.UPSTREAM_URL, "2/languages/"))
+        resp.raise_for_status()
+        existing = set(x["name"] for x in languages)
+        for lang in resp.json()["languages"]:
+            if lang["name"] not in existing:
+                languages.append(lang)
     return JsonResponse(
         {
             "languages": sorted(
-                [
-                    {"name": language.name, "code": row[0].upper()}
-                    for row in Card.objects.order_by().values_list("language").distinct()
-                    if (language := pycountry.languages.get(alpha_2=row[0])) is not None
-                ],
+                languages,
                 # sort like this so DEFAULT_LANGUAGE is first, then the rest of the languages are in alphabetical order
                 key=lambda row: "-" if row["code"] == DEFAULT_LANGUAGE.alpha_2 else row["name"],
             )
@@ -182,9 +223,13 @@ def get_tags(request: HttpRequest) -> HttpResponse:
 
     if request.method != "GET":
         raise BadRequestException("Expected GET request.")
-    return JsonResponse(
-        {"tags": sorted([tag.to_dict() for tag in Tags().tags.values() if tag.parent is None], key=lambda x: x["name"])}
-    )
+
+    tags = sorted([tag.to_dict() for tag in Tags().tags.values() if tag.parent is None], key=lambda x: x["name"])
+    if settings.UPSTREAM_URL is not None:
+        resp = requests.get(urljoin(settings.UPSTREAM_URL, "2/tags/"))
+        resp.raise_for_status()
+        tags = merge_tags(tags, resp.json()["tags"])
+    return JsonResponse({"tags": tags})
 
 
 @csrf_exempt
@@ -204,6 +249,17 @@ def post_cardbacks(request: HttpRequest) -> HttpResponse:
         raise BadRequestException(f"The provided JSON body is invalid:\n\n{e.message}")
 
     cardbacks = search_settings.retrieve_cardback_identifiers()
+    if settings.UPSTREAM_URL is not None:
+        upstream_json_body = copy.deepcopy(json_body)
+        sources = upstream_json_body["searchSettings"]["sourceSettings"]["sources"]
+        upstream_sources = [(id - UPSTREAM_ID_OFFSET, enabled) for id, enabled in sources if id >= UPSTREAM_ID_OFFSET]
+        upstream_json_body["searchSettings"]["sourceSettings"]["sources"] = upstream_sources
+        resp = requests.post(urljoin(settings.UPSTREAM_URL, "2/cardbacks/"), json=upstream_json_body)
+        resp.raise_for_status()
+        existing = set(cardbacks)
+        for card_id in resp.json()["cardbacks"]:
+            if card_id not in existing:
+                cardbacks.append(card_id)
     return JsonResponse({"cardbacks": cardbacks})
 
 
@@ -317,6 +373,14 @@ def get_contributions(request: HttpRequest) -> HttpResponse:
         raise BadRequestException("Expected GET request.")
 
     sources, card_count_by_type, total_database_size = summarise_contributions()
+    if settings.UPSTREAM_URL is not None:
+        resp = requests.get(urljoin(settings.UPSTREAM_URL, "2/contributions/"))
+        resp.raise_for_status()
+        upstream_data = resp.json()
+        sources.extend(upstream_data["sources"])
+        for key, count in upstream_data["card_count_by_type"].items():
+            card_count_by_type[key] = card_count_by_type.get(key, 0) + count
+        total_database_size += upstream_data["total_database_size"]
     return JsonResponse(
         {"sources": sources, "card_count_by_type": card_count_by_type, "total_database_size": total_database_size}
     )

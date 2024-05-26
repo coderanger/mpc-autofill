@@ -29,3 +29,17 @@ def log_hours_minutes_seconds_elapsed(t0: float) -> None:
 @ratelimit.limits(calls=1, period=0.1)  # type: ignore  # `ratelimit` does not implement decorator typing correctly
 def get_json_endpoint_rate_limited(url: str) -> dict[str, Any]:
     return json.loads(requests.get(url).content)
+
+
+def merge_tags(a: list[dict], b: list[dict]) -> list[dict]:
+    a_map = {v["name"]: v for v in a}
+    b_map = {v["name"]: v for v in b}
+    out_tags = []
+    for name in a_map.keys() | b_map.keys():
+        a_val = a_map.get(name)
+        b_val = b_map.get(name)
+        val = a_val or b_val
+        if a_val is not None and b_val is not None:
+            val["children"] = merge_tags(a_val["children"], b_val["children"])
+        out_tags.append(val)
+    return sorted(out_tags, key=lambda x: x["name"])

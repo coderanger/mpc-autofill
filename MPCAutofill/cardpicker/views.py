@@ -140,11 +140,12 @@ def post_cards(request: HttpRequest) -> HttpResponse:
     results = {x.identifier: x.to_dict() for x in Card.objects.filter(identifier__in=json_body["card_identifiers"])}
     if settings.UPSTREAM_URL is not None:
         upstream_card_identifiers = list(set(json_body["card_identifiers"]) - results.keys())
-        resp = requests.post(
-            urljoin(settings.UPSTREAM_URL, "2/cards/"), json={"card_identifiers": upstream_card_identifiers}
-        )
-        resp.raise_for_status()
-        results.update(resp.json()["results"])
+        if upstream_card_identifiers:
+            resp = requests.post(
+                urljoin(settings.UPSTREAM_URL, "2/cards/"), json={"card_identifiers": upstream_card_identifiers}
+            )
+            resp.raise_for_status()
+            results.update(resp.json()["results"])
     return JsonResponse({"results": results})
 
 
